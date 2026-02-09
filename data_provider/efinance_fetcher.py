@@ -211,11 +211,11 @@ class EfinanceFetcher(BaseFetcher):
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
         从 efinance 获取原始数据
-        
+
         根据代码类型自动选择 API：
         - 普通股票：使用 ef.stock.get_quote_history()
         - ETF 基金：使用 ef.fund.get_quote_history()
-        
+
         流程：
         1. 判断代码类型（股票/ETF）
         2. 设置随机 User-Agent
@@ -228,6 +228,55 @@ class EfinanceFetcher(BaseFetcher):
             return self._fetch_etf_data(stock_code, start_date, end_date)
         else:
             return self._fetch_stock_data(stock_code, start_date, end_date)
+
+    def _fetch_field_data(self, stock_code: str, field: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+        """
+        获取特定字段的数据（优化实现）
+
+        用于字段级回退机制，当某个字段缺失时，从当前数据源获取该字段
+
+        Args:
+            stock_code: 股票代码
+            field: 字段名称
+            start_date: 开始日期
+            end_date: 结束日期
+
+        Returns:
+            包含指定字段的数据DataFrame，失败返回None
+        """
+        try:
+            # 对于某些字段，可以更高效地获取
+            if field in ['volume', 'amount', 'pct_chg']:
+                # 这些字段通常需要获取完整数据
+                raw_df = self._fetch_raw_data(stock_code, start_date, end_date)
+                if raw_df is not None and not raw_df.empty:
+                    # 标准化数据
+                    df = self._normalize_data(raw_df, stock_code)
+                    # 只返回指定字段和日期
+                    result_cols = ['date'] if 'date' in df.columns else []
+                    result_cols.append(field)
+
+                    # 创建新的DataFrame，只包含需要的列
+                    result_df = df[result_cols].copy()
+                    return result_df
+
+            # 对于价格字段（open, high, low, close）
+            elif field in ['open', 'high', 'low', 'close']:
+                # 这些字段通常在一起，获取完整数据
+                raw_df = self._fetch_raw_data(stock_code, start_date, end_date)
+                if raw_df is not None and not raw_df.empty:
+                    df = self._normalize_data(raw_df, stock_code)
+                    result_cols = ['date'] if 'date' in df.columns else []
+                    result_cols.append(field)
+
+                    result_df = df[result_cols].copy()
+                    return result_df
+
+            return None
+
+        except Exception as e:
+            logger.debug(f"[{self.name}] 获取字段 {field} 失败: {e}")
+            return None
     
     def _fetch_stock_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """

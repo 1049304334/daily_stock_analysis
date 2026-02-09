@@ -256,72 +256,114 @@ class MarketAnalyzer:
         return indices
     
     def _get_market_statistics(self, overview: MarketOverview):
-        """获取市场涨跌统计"""
-        try:
-            logger.info("[大盘] 获取市场涨跌统计...")
-            
-            # 获取全部A股实时行情
-            df = self._call_akshare_with_retry(ak.stock_zh_a_spot_em, "A股实时行情", attempts=2)
-            
-            if df is not None and not df.empty:
-                # 涨跌统计
-                change_col = '涨跌幅'
-                if change_col in df.columns:
-                    df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
-                    overview.up_count = len(df[df[change_col] > 0])
-                    overview.down_count = len(df[df[change_col] < 0])
-                    overview.flat_count = len(df[df[change_col] == 0])
-                    
-                    # 涨停跌停统计（涨跌幅 >= 9.9% 或 <= -9.9%）
-                    overview.limit_up_count = len(df[df[change_col] >= 9.9])
-                    overview.limit_down_count = len(df[df[change_col] <= -9.9])
-                
-                # 两市成交额
-                amount_col = '成交额'
-                if amount_col in df.columns:
-                    df[amount_col] = pd.to_numeric(df[amount_col], errors='coerce')
-                    overview.total_amount = df[amount_col].sum() / 1e8  # 转为亿元
-                
-                logger.info(f"[大盘] 涨:{overview.up_count} 跌:{overview.down_count} 平:{overview.flat_count} "
-                          f"涨停:{overview.limit_up_count} 跌停:{overview.limit_down_count} "
-                          f"成交额:{overview.total_amount:.0f}亿")
-                
-        except Exception as e:
-            logger.error(f"[大盘] 获取涨跌统计失败: {e}")
+        """获取市场涨跌统计（支持多数据源自动切换）"""
+        df = None
+
+        # 数据源列表：按优先级尝试
+        data_sources = [
+            ("东方财富", lambda: ak.stock_zh_a_spot_em()),
+            # 可以添加更多备用数据源
+        ]
+
+        for source_name, source_func in data_sources:
+            try:
+                logger.info(f"[大盘] 尝试从 {source_name} 获取市场涨跌统计...")
+                df = self._call_akshare_with_retry(source_func, f"A股实时行情({source_name})", attempts=2)
+                if df is not None and not df.empty:
+                    logger.info(f"[大盘] ✓ {source_name} 数据源成功")
+                    break
+            except Exception as e:
+                logger.warning(f"[大盘] ✗ {source_name} 数据源失败: {str(e)[:60]}")
+                continue
+
+        # 处理获取到的数据
+        if df is not None and not df.empty:
+            # 涨跌统计
+            change_col = '涨跌幅'
+            if change_col in df.columns:
+                df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
+                overview.up_count = len(df[df[change_col] > 0])
+                overview.down_count = len(df[df[change_col] < 0])
+                overview.flat_count = len(df[df[change_col] == 0])
+
+                # 涨停跌停统计（涨跌幅 >= 9.9% 或 <= -9.9%）
+                overview.limit_up_count = len(df[df[change_col] >= 9.9])
+                overview.limit_down_count = len(df[df[change_col] <= -9.9])
+
+            # 两市成交额
+            amount_col = '成交额'
+            if amount_col in df.columns:
+                df[amount_col] = pd.to_numeric(df[amount_col], errors='coerce')
+                overview.total_amount = df[amount_col].sum() / 1e8  # 转为亿元
+
+            logger.info(f"[大盘] 涨:{overview.up_count} 跌:{overview.down_count} 平:{overview.flat_count} "
+                      f"涨停:{overview.limit_up_count} 跌停:{overview.limit_down_count} "
+                      f"成交额:{overview.total_amount:.0f}亿")
+        else:
+            logger.warning("[大盘] 所有数据源均失败，涨跌统计数据将为空")
     
     def _get_sector_rankings(self, overview: MarketOverview):
-        """获取板块涨跌榜"""
-        try:
-            logger.info("[大盘] 获取板块涨跌榜...")
-            
-            # 获取行业板块行情
-            df = self._call_akshare_with_retry(ak.stock_board_industry_name_em, "行业板块行情", attempts=2)
-            
-            if df is not None and not df.empty:
-                change_col = '涨跌幅'
-                if change_col in df.columns:
-                    df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
-                    df = df.dropna(subset=[change_col])
-                    
-                    # 涨幅前5
-                    top = df.nlargest(5, change_col)
-                    overview.top_sectors = [
-                        {'name': row['板块名称'], 'change_pct': row[change_col]}
-                        for _, row in top.iterrows()
-                    ]
-                    
-                    # 跌幅前5
-                    bottom = df.nsmallest(5, change_col)
-                    overview.bottom_sectors = [
-                        {'name': row['板块名称'], 'change_pct': row[change_col]}
-                        for _, row in bottom.iterrows()
-                    ]
-                    
-                    logger.info(f"[大盘] 领涨板块: {[s['name'] for s in overview.top_sectors]}")
-                    logger.info(f"[大盘] 领跌板块: {[s['name'] for s in overview.bottom_sectors]}")
-                    
-        except Exception as e:
-            logger.error(f"[大盘] 获取板块涨跌榜失败: {e}")
+        """获取板块涨跌榜（支持多数据源自动切换）"""
+        # 数据源配置：(名称, API函数, 列名映射)
+        data_sources = [
+            (
+                "东方财富",
+                lambda: ak.stock_board_industry_name_em(),
+                {'name': '板块名称', 'change': '涨跌幅'}
+            ),
+            (
+                "新浪",
+                lambda: ak.stock_sector_spot(),
+                {'name': '板块', 'change': '涨跌幅'}
+            ),
+        ]
+
+        for source_name, source_func, col_mapping in data_sources:
+            try:
+                logger.info(f"[大盘] 尝试从 {source_name} 获取板块涨跌榜...")
+                df = self._call_akshare_with_retry(source_func, f"板块行情({source_name})", attempts=2)
+
+                if df is None or df.empty:
+                    logger.warning(f"[大盘] {source_name} 返回空数据")
+                    continue
+
+                # 获取列名
+                name_col = col_mapping['name']
+                change_col = col_mapping['change']
+
+                # 检查列是否存在
+                if name_col not in df.columns or change_col not in df.columns:
+                    logger.warning(f"[大盘] {source_name} 缺少必要列: {list(df.columns)}")
+                    continue
+
+                # 处理数据
+                df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
+                df = df.dropna(subset=[change_col])
+
+                # 涨幅前5
+                top = df.nlargest(5, change_col)
+                overview.top_sectors = [
+                    {'name': row[name_col], 'change_pct': row[change_col]}
+                    for _, row in top.iterrows()
+                ]
+
+                # 跌幅前5
+                bottom = df.nsmallest(5, change_col)
+                overview.bottom_sectors = [
+                    {'name': row[name_col], 'change_pct': row[change_col]}
+                    for _, row in bottom.iterrows()
+                ]
+
+                logger.info(f"[大盘] ✓ {source_name} 数据源成功")
+                logger.info(f"[大盘] 领涨板块: {[s['name'] for s in overview.top_sectors]}")
+                logger.info(f"[大盘] 领跌板块: {[s['name'] for s in overview.bottom_sectors]}")
+                return  # 成功获取，退出
+
+            except Exception as e:
+                logger.warning(f"[大盘] ✗ {source_name} 数据源失败: {str(e)[:60]}")
+                continue
+
+        logger.warning("[大盘] 所有板块数据源均失败，板块数据将为空")
     
     # def _get_north_flow(self, overview: MarketOverview):
     #     """获取北向资金流入"""

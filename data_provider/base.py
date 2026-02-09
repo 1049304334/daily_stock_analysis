@@ -89,11 +89,39 @@ class BaseFetcher(ABC):
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         """
         标准化数据列名（子类必须实现）
-        
+
         将不同数据源的列名统一为：
         ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
         """
         pass
+
+    def _fetch_field_data(self, stock_code: str, field: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+        """
+        获取特定字段的数据（子类可选择实现）
+
+        用于字段级回退机制，当某个字段缺失时，从当前数据源获取该字段
+
+        Args:
+            stock_code: 股票代码
+            field: 字段名称
+            start_date: 开始日期
+            end_date: 结束日期
+
+        Returns:
+            包含指定字段的数据DataFrame，失败返回None
+        """
+        # 默认实现：获取完整数据后提取指定字段
+        try:
+            df = self._fetch_raw_data(stock_code, start_date, end_date)
+            if df is not None and not df.empty:
+                # 标准化数据
+                df = self._normalize_data(df, stock_code)
+                # 只返回指定字段
+                if field in df.columns:
+                    return df[['date', field]] if 'date' in df.columns else df[[field]]
+        except Exception:
+            pass
+        return None
     
     def get_daily_data(
         self, 
@@ -311,35 +339,46 @@ class DataFetcherManager:
         self._fetchers.sort(key=lambda f: f.priority)
     
     def get_daily_data(
-        self, 
+        self,
         stock_code: str,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-        days: int = 30
+        days: int = 30,
+        enable_field_fallback: bool = True
     ) -> Tuple[pd.DataFrame, str]:
         """
-        获取日线数据（自动切换数据源）
-        
+        获取日线数据（自动切换数据源，支持字段级回退）
+
         故障切换策略：
         1. 从最高优先级数据源开始尝试
         2. 捕获异常后自动切换到下一个
         3. 记录每个数据源的失败原因
         4. 所有数据源失败后抛出详细异常
-        
+
+        字段级回退策略（当 enable_field_fallback=True）：
+        1. 首选数据源获取主要数据
+        2. 检测缺失字段
+        3. 对缺失字段，使用其他数据源补全
+        4. 合并所有字段数据
+
         Args:
             stock_code: 股票代码
             start_date: 开始日期
             end_date: 结束日期
             days: 获取天数
-            
+            enable_field_fallback: 是否启用字段级回退
+
         Returns:
             Tuple[DataFrame, str]: (数据, 成功的数据源名称)
-            
+
         Raises:
             DataFetchError: 所有数据源都失败时抛出
         """
         errors = []
-        
+        primary_fetcher_success = None
+        primary_df = None
+
+        # 第一阶段：尝试获取主要数据
         for fetcher in self._fetchers:
             try:
                 logger.info(f"尝试使用 [{fetcher.name}] 获取 {stock_code}...")
@@ -349,18 +388,60 @@ class DataFetcherManager:
                     end_date=end_date,
                     days=days
                 )
-                
+
                 if df is not None and not df.empty:
-                    logger.info(f"[{fetcher.name}] 成功获取 {stock_code}")
-                    return df, fetcher.name
-                    
+                    primary_fetcher_success = fetcher
+                    primary_df = df
+                    logger.info(f"[{fetcher.name}] 主要数据获取成功")
+                    break
+
             except Exception as e:
                 error_msg = f"[{fetcher.name}] 失败: {str(e)}"
                 logger.warning(error_msg)
                 errors.append(error_msg)
                 # 继续尝试下一个数据源
                 continue
-        
+
+        # 如果没有获取到主要数据，进行传统故障切换
+        if primary_df is None:
+            for fetcher in self._fetchers:
+                try:
+                    logger.info(f"故障切换：尝试 [{fetcher.name}] 获取 {stock_code}...")
+                    df = fetcher.get_daily_data(
+                        stock_code=stock_code,
+                        start_date=start_date,
+                        end_date=end_date,
+                        days=days
+                    )
+
+                    if df is not None and not df.empty:
+                        logger.info(f"[{fetcher.name}] 故障切换成功获取 {stock_code}")
+                        return df, fetcher.name
+
+                except Exception as e:
+                    error_msg = f"[{fetcher.name}] 故障切换失败: {str(e)}"
+                    logger.warning(error_msg)
+                    errors.append(error_msg)
+                    continue
+
+        # 第二阶段：字段级回退
+        if primary_df is not None and enable_field_fallback:
+            try:
+                enhanced_df = self._apply_field_fallback(
+                    primary_df, primary_fetcher_success, stock_code,
+                    start_date, end_date, days
+                )
+                logger.info(f"[字段级回退] {stock_code} 最终数据完成，共 {len(enhanced_df)} 条记录")
+                return enhanced_df, primary_fetcher_success.name + "_enhanced"
+            except Exception as e:
+                logger.warning(f"[字段级回退] {stock_code} 回退失败: {e}")
+                # 回退失败，返回原始数据
+                return primary_df, primary_fetcher_success.name
+
+        # 第三阶段：返回原始数据或报错
+        if primary_df is not None:
+            return primary_df, primary_fetcher_success.name if primary_fetcher_success else "unknown"
+
         # 所有数据源都失败
         error_summary = f"所有数据源获取 {stock_code} 失败:\n" + "\n".join(errors)
         logger.error(error_summary)
@@ -630,34 +711,170 @@ class DataFetcherManager:
         logger.warning(f"[股票名称] 所有数据源都无法获取 {stock_code} 的名称")
         return None
 
+    def _apply_field_fallback(
+        self,
+        primary_df: pd.DataFrame,
+        primary_fetcher: BaseFetcher,
+        stock_code: str,
+        start_date: Optional[str],
+        end_date: Optional[str],
+        days: int
+    ) -> pd.DataFrame:
+        """
+        应用字段级回退机制
+
+        Args:
+            primary_df: 主要数据源获取的数据
+            primary_fetcher: 主要数据源
+            stock_code: 股票代码
+            start_date: 开始日期
+            end_date: 结束日期
+            days: 获取天数
+
+        Returns:
+            补全后的DataFrame
+        """
+        df = primary_df.copy()
+
+        # 检查哪些标准字段缺失
+        standard_columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
+        missing_fields = [col for col in standard_columns if col not in df.columns]
+
+        if not missing_fields:
+            logger.info(f"[字段级回退] {stock_code} 没有缺失字段")
+            return df
+
+        logger.info(f"[字段级回退] {stock_code} 缺失字段: {missing_fields}")
+
+        # 按字段进行回退
+        for field in missing_fields:
+            logger.info(f"[字段级回退] 尝试补全字段: {field}")
+
+            # 获取日期范围（用于字段回退）
+            if start_date is None:
+                from datetime import datetime, timedelta
+                end_date = datetime.now().strftime('%Y-%m-%d')
+                start_dt = datetime.strptime(end_date, '%Y-%m-%d') - timedelta(days=days * 2)
+                start_date = start_dt.strftime('%Y-%m-%d')
+
+            # 尝试用其他数据源获取该字段
+            for fetcher in self._fetchers:
+                if fetcher == primary_fetcher:
+                    continue  # 跳过主要数据源
+
+                try:
+                    # 获取该字段的数据
+                    field_data = fetcher._fetch_field_data(stock_code, field, start_date, end_date)
+
+                    if field_data is not None and not field_data.empty:
+                        # 合并字段数据
+                        if field in field_data.columns:
+                            # 如果有日期列，按日期合并
+                            if 'date' in field_data.columns:
+                                # 确保主数据有日期列
+                                if 'date' not in df.columns and 'date' in primary_df.columns:
+                                    df = df.merge(
+                                        field_data[['date', field]],
+                                        on='date',
+                                        how='left',
+                                        suffixes=('', f'_{field}_fallback')
+                                    )
+                                else:
+                                    # 如果没有日期列，直接添加
+                                    df[field] = field_data[field].values
+                            else:
+                                # 没有日期列，直接添加
+                                df[field] = field_data[field].values
+
+                            logger.info(f"[字段级回退] {field} 字段补全成功 (来源: {fetcher.name})")
+                            break
+
+                except Exception as e:
+                    logger.debug(f"[字段级回退] {fetcher.name} 获取字段 {field} 失败: {e}")
+                    continue
+
+            # 如果字段仍然缺失，尝试使用插值或其他方法
+            if field not in df.columns:
+                logger.warning(f"[字段级回退] {field} 字段最终无法补全")
+
+                # 对数值型字段尝试插值
+                if field in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+                    # 使用其他相关字段计算
+                    if field == 'pct_chg' and 'close' in df.columns:
+                        # 涨跌幅 = (今日收盘 - 昨日收盘) / 昨日收盘 * 100
+                        df['pct_chg'] = df['close'].pct_change() * 100
+
+                # 如果是成交量字段，且收盘价有数据，可以估算
+                elif field == 'volume' and 'close' in df.columns:
+                    # 使用历史成交量的平均值估算
+                    avg_volume = df['close'].rolling(window=5).mean()
+                    df['volume'] = avg_volume.fillna(avg_volume.mean())
+
+                # 添加默认值
+                if field not in df.columns:
+                    if field in ['open', 'high', 'low', 'close']:
+                        df[field] = df.get('close', 0)
+                    elif field == 'volume':
+                        df[field] = 0
+                    elif field == 'amount':
+                        df[field] = 0
+                    elif field == 'pct_chg':
+                        df[field] = 0.0
+
+        # 最后一次清理：确保所有必要字段都存在
+        for col in standard_columns:
+            if col not in df.columns:
+                logger.warning(f"[字段级回退] {col} 字段最终缺失，使用默认值")
+                if col == 'date':
+                    # 添加日期列（从索引生成）
+                    df['date'] = pd.date_range(start=start_date, periods=len(df), freq='D')
+                elif col in ['open', 'high', 'low', 'close']:
+                    df[col] = df.get('close', 0)
+                elif col == 'volume':
+                    df[col] = 0
+                elif col == 'amount':
+                    df[col] = 0
+                elif col == 'pct_chg':
+                    df[col] = 0.0
+
+        # 重新排序列
+        df = df[['date', 'code', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg'] +
+                [col for col in df.columns if col not in ['date', 'code', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']]]
+
+        # 清理数据
+        df = df.dropna(subset=['close', 'volume'])
+        df = df.sort_values('date', ascending=True).reset_index(drop=True)
+
+        return df
+
     def batch_get_stock_names(self, stock_codes: List[str]) -> Dict[str, str]:
         """
         批量获取股票中文名称
-        
+
         先尝试从支持批量查询的数据源获取股票列表，
         然后再逐个查询缺失的股票名称。
-        
+
         Args:
             stock_codes: 股票代码列表
-            
+
         Returns:
             {股票代码: 股票名称} 字典
         """
         result = {}
         missing_codes = set(stock_codes)
-        
+
         # 1. 先检查缓存
         if not hasattr(self, '_stock_name_cache'):
             self._stock_name_cache = {}
-        
+
         for code in stock_codes:
             if code in self._stock_name_cache:
                 result[code] = self._stock_name_cache[code]
                 missing_codes.discard(code)
-        
+
         if not missing_codes:
             return result
-        
+
         # 2. 尝试批量获取股票列表
         for fetcher in self._fetchers:
             if hasattr(fetcher, 'get_stock_list') and missing_codes:
@@ -672,21 +889,21 @@ class DataFetcherManager:
                                 if code in missing_codes:
                                     result[code] = name
                                     missing_codes.discard(code)
-                        
+
                         if not missing_codes:
                             break
-                        
+
                         logger.info(f"[股票名称] 从 {fetcher.name} 批量获取完成，剩余 {len(missing_codes)} 个待查")
                 except Exception as e:
                     logger.debug(f"[股票名称] {fetcher.name} 批量获取失败: {e}")
                     continue
-        
+
         # 3. 逐个获取剩余的
         for code in list(missing_codes):
             name = self.get_stock_name(code)
             if name:
                 result[code] = name
                 missing_codes.discard(code)
-        
+
         logger.info(f"[股票名称] 批量获取完成，成功 {len(result)}/{len(stock_codes)}")
         return result
