@@ -795,22 +795,59 @@ class DataFetcherManager:
 
             # 如果字段仍然缺失，尝试使用插值或其他方法
             if field not in df.columns:
-                logger.warning(f"[字段级回退] {field} 字段最终无法补全")
+                logger.warning(f"[字段级回退] {field} 字段所有数据源均无法获取，尝试计算或使用默认值")
 
-                # 对数值型字段尝试插值
+                # 对数值型字段尝试插值或计算
                 if field in ['open', 'high', 'low', 'close', 'volume', 'amount']:
                     # 使用其他相关字段计算
                     if field == 'pct_chg' and 'close' in df.columns:
                         # 涨跌幅 = (今日收盘 - 昨日收盘) / 昨日收盘 * 100
                         df['pct_chg'] = df['close'].pct_change() * 100
+                        logger.info(f"[字段级回退] pct_chg 已通过收盘价计算得出")
 
                 # 如果是成交量字段，且收盘价有数据，可以估算
                 elif field == 'volume' and 'close' in df.columns:
                     # 使用历史成交量的平均值估算
                     avg_volume = df['close'].rolling(window=5).mean()
                     df['volume'] = avg_volume.fillna(avg_volume.mean())
+                    logger.info(f"[字段级回退] volume 已通过历史均值估算")
 
-                # 添加默认值
+                # 特殊处理成交额字段：尝试通过成交量 × 平均价格计算
+                elif field == 'amount':
+                    logger.info(f"[字段级回退] 尝试计算成交额字段")
+
+                    # 检查是否有成交量和价格数据可以用于计算
+                    if 'volume' in df.columns and not df['volume'].isna().all():
+                        # 尝试多种方式计算平均价格
+                        avg_price = None
+
+                        # 方式1：使用 (开盘 + 收盘 + 最高 + 最低) / 4
+                        if all(col in df.columns for col in ['open', 'close', 'high', 'low']):
+                            avg_price = (df['open'] + df['close'] + df['high'] + df['low']) / 4
+                            logger.info(f"[字段级回退] 使用 OHLC 均价计算成交额")
+
+                        # 方式2：使用 (开盘 + 收盘) / 2
+                        elif all(col in df.columns for col in ['open', 'close']):
+                            avg_price = (df['open'] + df['close']) / 2
+                            logger.info(f"[字段级回退] 使用 开盘收盘均价 计算成交额")
+
+                        # 方式3：仅使用收盘价
+                        elif 'close' in df.columns:
+                            avg_price = df['close']
+                            logger.info(f"[字段级回退] 使用收盘价计算成交额")
+
+                        # 计算成交额 = 成交量 × 平均价格
+                        if avg_price is not None:
+                            # 成交量单位通常是手(100股)，价格单位是元/股
+                            # 成交额(元) = 成交量(手) × 100 × 平均价格(元/股)
+                            df['amount'] = df['volume'] * 100 * avg_price
+                            logger.info(f"[字段级回退] 成交额已通过计算得出: volume × 100 × avg_price")
+                        else:
+                            logger.warning(f"[字段级回退] 无法计算成交额：缺少价格数据")
+                    else:
+                        logger.warning(f"[字段级回退] 无法计算成交额：缺少成交量数据")
+
+                # 添加默认值（仅当计算也失败时）
                 if field not in df.columns:
                     if field in ['open', 'high', 'low', 'close']:
                         df[field] = df.get('close', 0)
@@ -818,6 +855,7 @@ class DataFetcherManager:
                         df[field] = 0
                     elif field == 'amount':
                         df[field] = 0
+                        logger.warning(f"[字段级回退] 成交额设置为0（所有数据源均无此字段且无法计算）")
                     elif field == 'pct_chg':
                         df[field] = 0.0
 

@@ -69,7 +69,7 @@ class MarketOverview:
     limit_up_count: int = 0             # 涨停家数
     limit_down_count: int = 0           # 跌停家数
     total_amount: float = 0.0           # 两市成交额（亿元）
-    north_flow: float = 0.0             # 北向资金净流入（亿元）
+    # 注意：北向资金数据已不再公开，已移除相关字段
     
     # 板块涨幅榜
     top_sectors: List[Dict] = field(default_factory=list)     # 涨幅前5板块
@@ -262,7 +262,7 @@ class MarketAnalyzer:
         # 数据源列表：按优先级尝试
         data_sources = [
             ("东方财富", lambda: ak.stock_zh_a_spot_em()),
-            # 可以添加更多备用数据源
+            ("新浪", lambda: ak.stock_zh_a_spot()),
         ]
 
         for source_name, source_func in data_sources:
@@ -278,9 +278,16 @@ class MarketAnalyzer:
 
         # 处理获取到的数据
         if df is not None and not df.empty:
-            # 涨跌统计
-            change_col = '涨跌幅'
-            if change_col in df.columns:
+            # 涨跌统计 - 支持多种列名
+            change_col_candidates = ['涨跌幅', '涨跌%', 'change_pct', '涨跌']
+            change_col = None
+            for col in change_col_candidates:
+                if col in df.columns:
+                    change_col = col
+                    logger.info(f"[大盘] 使用列名: {col} (涨跌幅)")
+                    break
+
+            if change_col:
                 df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
                 overview.up_count = len(df[df[change_col] > 0])
                 overview.down_count = len(df[df[change_col] < 0])
@@ -290,17 +297,70 @@ class MarketAnalyzer:
                 overview.limit_up_count = len(df[df[change_col] >= 9.9])
                 overview.limit_down_count = len(df[df[change_col] <= -9.9])
 
-            # 两市成交额
-            amount_col = '成交额'
-            if amount_col in df.columns:
-                df[amount_col] = pd.to_numeric(df[amount_col], errors='coerce')
-                overview.total_amount = df[amount_col].sum() / 1e8  # 转为亿元
+            # 两市成交额 - 支持多种列名
+            amount_col_candidates = ['成交额', '总金额', 'amount', '成交金额', '金额']
+            amount_col = None
+            for col in amount_col_candidates:
+                if col in df.columns:
+                    amount_col = col
+                    logger.info(f"[大盘] 使用列名: {col} (成交额)")
+                    break
 
-            logger.info(f"[大盘] 涨:{overview.up_count} 跌:{overview.down_count} 平:{overview.flat_count} "
-                      f"涨停:{overview.limit_up_count} 跌停:{overview.limit_down_count} "
-                      f"成交额:{overview.total_amount:.0f}亿")
+            if amount_col:
+                df[amount_col] = pd.to_numeric(df[amount_col], errors='coerce')
+                # 过滤无效数据（<=0 或异常大的值）
+                valid_amounts = df[(df[amount_col] > 0) & (df[amount_col] < 1e15)][amount_col]
+                if not valid_amounts.empty:
+                    overview.total_amount = valid_amounts.sum() / 1e8  # 转为亿元
+                    logger.info(f"[大盘] 通过 {amount_col} 列计算两市成交额: {overview.total_amount:.0f}亿")
+                else:
+                    logger.warning(f"[大盘] {amount_col} 列无有效数据，尝试备用方案")
+                    amount_col = None
+
+            # 如果成交额列获取失败，尝试通过指数成交额估算
+            if not amount_col or overview.total_amount == 0:
+                logger.info(f"[大盘] 尝试通过指数成交额估算两市成交额...")
+                overview.total_amount = self._estimate_total_amount_from_indices(overview)
         else:
-            logger.warning("[大盘] 所有数据源均失败，涨跌统计数据将为空")
+            logger.warning("[大盘] 所有数据源均失败，尝试通过指数成交额估算")
+            # 尝试通过指数成交额估算
+            overview.total_amount = self._estimate_total_amount_from_indices(overview)
+
+        logger.info(f"[大盘] 涨:{overview.up_count} 跌:{overview.down_count} 平:{overview.flat_count} "
+                  f"涨停:{overview.limit_up_count} 跌停:{overview.limit_down_count} "
+                  f"成交额:{overview.total_amount:.0f}亿")
+
+    def _estimate_total_amount_from_indices(self, overview: MarketOverview) -> float:
+        """
+        通过主要指数成交额估算两市成交总额
+
+        上证指数成交额 × 2.5 ≈ 两市成交总额
+        （经验系数：深市成交额约为沪市的 1.5 倍）
+        """
+        try:
+            # 获取上证指数成交额
+            for idx in overview.indices:
+                if idx.code == 'sh000001' and idx.amount > 0:
+                    # 上证成交额单位是元，转换为亿元
+                    sh_amount = idx.amount / 1e8
+                    # 使用经验系数估算两市总成交额
+                    estimated_total = sh_amount * 2.5
+                    logger.info(f"[大盘] 通过上证成交额估算: {sh_amount:.0f}亿 × 2.5 = {estimated_total:.0f}亿")
+                    return estimated_total
+
+            # 如果上证指数没有成交额，尝试通过深证成指
+            for idx in overview.indices:
+                if idx.code == 'sz399001' and idx.amount > 0:
+                    sz_amount = idx.amount / 1e8
+                    # 深市约为沪市的 1.5 倍，所以两市总额约为深市的 2.67 倍
+                    estimated_total = sz_amount * 2.67
+                    logger.info(f"[大盘] 通过深证成指成交额估算: {sz_amount:.0f}亿 × 2.67 = {estimated_total:.0f}亿")
+                    return estimated_total
+
+        except Exception as e:
+            logger.warning(f"[大盘] 指数成交额估算失败: {e}")
+
+        return 0.0
     
     def _get_sector_rankings(self, overview: MarketOverview):
         """获取板块涨跌榜（支持多数据源自动切换）"""
@@ -525,7 +585,6 @@ class MarketAnalyzer:
 - 上涨: {overview.up_count} 家 | 下跌: {overview.down_count} 家 | 平盘: {overview.flat_count} 家
 - 涨停: {overview.limit_up_count} 家 | 跌停: {overview.limit_down_count} 家
 - 两市成交额: {overview.total_amount:.0f} 亿元
-- 北向资金: {overview.north_flow:+.2f} 亿元
 
 ## 板块表现
 领涨: {top_sectors_text if top_sectors_text else "暂无数据"}
@@ -548,8 +607,8 @@ class MarketAnalyzer:
 ### 二、指数点评
 （分析上证、深证、创业板等各指数走势特点）
 
-### 三、资金动向
-（解读成交额和北向资金流向的含义）
+### 三、市场量能
+（解读成交额变化及市场活跃度）
 
 ### 四、热点解读
 （分析领涨领跌板块背后的逻辑和驱动因素）
@@ -609,7 +668,6 @@ class MarketAnalyzer:
 | 涨停 | {overview.limit_up_count} |
 | 跌停 | {overview.limit_down_count} |
 | 两市成交额 | {overview.total_amount:.0f}亿 |
-| 北向资金 | {overview.north_flow:+.2f}亿 |
 
 ### 四、板块表现
 - **领涨**: {top_text}

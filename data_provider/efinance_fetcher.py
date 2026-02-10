@@ -414,15 +414,15 @@ class EfinanceFetcher(BaseFetcher):
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         """
         标准化 efinance 数据
-        
+
         efinance 返回的列名（中文）：
         股票名称, 股票代码, 日期, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 振幅, 涨跌幅, 涨跌额, 换手率
-        
+
         需要映射到标准列名：
         date, open, high, low, close, volume, amount, pct_chg
         """
         df = df.copy()
-        
+
         # 列名映射（efinance 中文列名 -> 标准英文列名）
         column_mapping = {
             '日期': 'date',
@@ -439,9 +439,59 @@ class EfinanceFetcher(BaseFetcher):
             '基金代码': 'code',
             '基金名称': 'name',
         }
-        
-        # 重命名列
+
+        # 备选列名映射（用于处理不同数据源返回的变体列名）
+        alternative_mapping = {
+            # 日期变体
+            'trade_date': 'date',
+            '时间': 'date',
+            'datetime': 'date',
+
+            # 开盘价变体
+            '开盘价': 'open',
+            'open_price': 'open',
+
+            # 收盘价变体
+            '收盘价': 'close',
+            'close_price': 'close',
+
+            # 最高价变体
+            '最高价': 'high',
+            'high_price': 'high',
+
+            # 最低价变体
+            '最低价': 'low',
+            'low_price': 'low',
+
+            # 成交量变体
+            'vol': 'volume',
+            '量': 'volume',
+
+            # 成交额变体
+            '总金额': 'amount',
+            '金额': 'amount',
+            'turnover': 'amount',
+            '成交金额': 'amount',
+
+            # 涨跌幅变体
+            '涨跌': 'pct_chg',
+            'change_percent': 'pct_chg',
+            'change_pct': 'pct_chg',
+        }
+
+        # 先应用主映射
         df = df.rename(columns=column_mapping)
+
+        # 检查标准列是否都已映射成功，如果没有则尝试备选映射
+        from data_provider.base import STANDARD_COLUMNS
+        for std_col in STANDARD_COLUMNS:
+            if std_col not in df.columns:
+                # 尝试从备选映射中找到匹配的列
+                for alt_col, mapped_col in alternative_mapping.items():
+                    if mapped_col == std_col and alt_col in df.columns:
+                        df = df.rename(columns={alt_col: std_col})
+                        logger.info(f"[efinance列名映射] 使用备选列名: {alt_col} -> {std_col}")
+                        break
         
         # 如果没有 code 列，手动添加
         if 'code' not in df.columns:
